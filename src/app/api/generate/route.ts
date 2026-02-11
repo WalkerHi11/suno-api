@@ -26,20 +26,21 @@ export async function POST(req: NextRequest) {
         }
       });
     } catch (error: any) {
-      console.error('Error generating custom audio:', JSON.stringify(error.response.data));
-      if (error.response.status === 402) {
-        return new NextResponse(JSON.stringify({ error: error.response.data.detail }), {
-          status: 402,
-          headers: {
-            'Content-Type': 'application/json',
-            ...corsHeaders
-          }
-        });
+      const rawDetail = error?.response?.data?.detail || error?.message || error?.toString?.() || 'Unknown error';
+      const detail = typeof rawDetail === 'string' ? rawDetail : JSON.stringify(rawDetail);
+      let status = error?.response?.status || 500;
+      if (
+        status === 500 &&
+        (detail.includes('Server busy') || detail.includes('Timed out waiting for capacity'))
+      ) {
+        status = 429;
       }
-      return new NextResponse(JSON.stringify({ error: 'Internal server error: ' + JSON.stringify(error.response.data.detail) }), {
-        status: 500,
+      console.error('Error generating audio:', status, detail);
+      return new NextResponse(JSON.stringify({ error: detail }), {
+        status,
         headers: {
           'Content-Type': 'application/json',
+          ...(status === 429 ? { 'Retry-After': '15' } : {}),
           ...corsHeaders
         }
       });

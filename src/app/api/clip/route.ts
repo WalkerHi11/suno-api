@@ -28,11 +28,19 @@ export async function GET(req: NextRequest) {
           ...corsHeaders
         }
       });
-    } catch (error) {
-      console.error('Error fetching audio:', error);
-
-      return new NextResponse(JSON.stringify({ error: 'Internal server error' }), {
-        status: 500,
+    } catch (error: any) {
+      const rawDetail =
+        error?.response?.data?.detail ||
+        error?.response?.data?.error ||
+        error?.message ||
+        error?.toString?.() ||
+        'Unknown error';
+      const detailRaw = typeof rawDetail === 'string' ? rawDetail : JSON.stringify(rawDetail);
+      const detail = detailRaw.length > 8000 ? `${detailRaw.slice(0, 8000)}…(truncated)` : detailRaw;
+      const status = error?.response?.status || 500;
+      console.error('Error fetching audio:', status, detail);
+      return new NextResponse(JSON.stringify({ error: detail }), {
+        status,
         headers: {
           'Content-Type': 'application/json',
           ...corsHeaders

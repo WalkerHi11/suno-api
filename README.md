@@ -107,6 +107,10 @@ docker compose build && docker compose up
 - `BROWSER_GHOST_CURSOR` — use ghost-cursor-playwright to simulate smooth mouse movements. Please note that it doesn't seem to make any difference in the rate of CAPTCHAs, so you can set it to `false`. Retained for future testing.
 - `BROWSER_LOCALE` — the language of the browser. Using either `en` or `ru` is recommended, since those have the most workers on 2Captcha. [List of supported languages](https://2captcha.com/2captcha-api#language)
 - `BROWSER_HEADLESS` — run the browser without the window. You probably want to set this to `true`.
+- `CAPTCHA_TOKEN_TIMEOUT_MS` — max time to wait for the hCaptcha token before aborting (milliseconds). Default: `180000`.
+- `SUNO_MAX_CONCURRENT_CAPTCHAS` — limit how many browser/captcha sessions can run at once. Default: `1`.
+- `SUNO_MAX_QUEUED_CAPTCHAS` — cap queued captcha waiters to prevent overload. Default: `20`.
+- `SUNO_CAPTCHA_ACQUIRE_TIMEOUT_MS` — max time to wait to acquire captcha capacity (ms). Default: `240000`.
 ```bash
 SUNO_COOKIE=<…>
 TWOCAPTCHA_KEY=<…>
@@ -114,6 +118,10 @@ BROWSER=chromium
 BROWSER_GHOST_CURSOR=false
 BROWSER_LOCALE=en
 BROWSER_HEADLESS=true
+CAPTCHA_TOKEN_TIMEOUT_MS=180000
+SUNO_MAX_CONCURRENT_CAPTCHAS=1
+SUNO_MAX_QUEUED_CAPTCHAS=20
+SUNO_CAPTCHA_ACQUIRE_TIMEOUT_MS=240000
 ```
 
 ### 5. Run suno-api

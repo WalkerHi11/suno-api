@@ -37,8 +37,10 @@ export const isPage = (target: any): target is Page => {
  */
 export const waitForRequests = (page: Page, signal: AbortSignal): Promise<void> => {
   return new Promise((resolve, reject) => {
-    const urlPattern = /^https:\/\/img[a-zA-Z0-9]*\.hcaptcha\.com\/.*$/;
+    const urlPattern =
+      /^https:\/\/(?:img[a-zA-Z0-9-]*\.hcaptcha\.com|hcaptcha-imgs[a-zA-Z0-9-]*\.suno\.com)\/.*$/;
     let timeoutHandle: NodeJS.Timeout | null = null;
+    let initialTimeout: NodeJS.Timeout | null = null;
     let activeRequestCount = 0;
     let requestOccurred = false;
 
@@ -65,6 +67,10 @@ export const waitForRequests = (page: Page, signal: AbortSignal): Promise<void> 
         activeRequestCount++;
         if (timeoutHandle)
           clearTimeout(timeoutHandle);
+        if (initialTimeout) {
+          clearTimeout(initialTimeout);
+          initialTimeout = null;
+        }
       }
     };
 
@@ -75,32 +81,26 @@ export const waitForRequests = (page: Page, signal: AbortSignal): Promise<void> 
       }
     };
 
-    // Wait for an hCaptcha request for up to 1 minute
-    const initialTimeout = setTimeout(() => {
+    // Wait for an hCaptcha request (configurable, default 2 minutes)
+    const initialWaitMs = Number.parseInt(process.env.CAPTCHA_INITIAL_WAIT_MS || '', 10) || 120000;
+    initialTimeout = setTimeout(() => {
       if (!requestOccurred) {
-        page.off('request', onRequest);
         cleanupListeners();
-        reject(new Error('No hCaptcha request occurred within 1 minute.'));
+        reject(new Error(`No hCaptcha request occurred within ${initialWaitMs / 1000} seconds.`));
       } else {
         // Start waiting for no hCaptcha requests
         resetTimeout();
       }
-    }, 60000); // 1 minute timeout
+    }, initialWaitMs); // Configurable timeout (default 2 minutes)
 
     page.on('request', onRequest);
     page.on('requestfinished', onRequestFinished);
     page.on('requestfailed', onRequestFinished);
 
-    // Cleanup the initial timeout if an hCaptcha request occurs
-    page.on('request', (request: { url: () => string }) => {
-      if (urlPattern.test(request.url())) {
-        clearTimeout(initialTimeout);
-      }
-    });
-
     const onAbort = () => {
       cleanupListeners();
-      clearTimeout(initialTimeout);
+      if (initialTimeout)
+        clearTimeout(initialTimeout);
       if (timeoutHandle)
         clearTimeout(timeoutHandle);
       signal.removeEventListener('abort', onAbort);
@@ -115,4 +115,69 @@ export const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+}
+
+type SemaphoreWaiter = {
+  resolve: (release: () => void) => void
+  reject: (err: Error) => void
+  timeoutId?: NodeJS.Timeout
+}
+
+export class AsyncSemaphore {
+  private inUse = 0
+  private readonly waiters: SemaphoreWaiter[] = []
+
+  constructor(
+    private readonly capacity: number,
+    private readonly maxQueue: number = Number.POSITIVE_INFINITY
+  ) {
+    if (!Number.isFinite(capacity) || capacity <= 0) {
+      throw new Error(`AsyncSemaphore capacity must be > 0 (got ${capacity})`)
+    }
+  }
+
+  public stats() {
+    return { capacity: this.capacity, in_use: this.inUse, queued: this.waiters.length }
+  }
+
+  public async acquire(options?: { timeoutMs?: number }): Promise<() => void> {
+    const timeoutMs = options?.timeoutMs
+    if (this.inUse < this.capacity) {
+      this.inUse++
+      return () => this.release()
+    }
+
+    if (this.waiters.length >= this.maxQueue) {
+      throw new Error('Server busy (semaphore queue full). Try again soon.')
+    }
+
+    return new Promise<() => void>((resolve, reject) => {
+      const waiter: SemaphoreWaiter = {
+        resolve,
+        reject,
+      }
+      if (timeoutMs && timeoutMs > 0) {
+        waiter.timeoutId = setTimeout(() => {
+          const idx = this.waiters.indexOf(waiter)
+          if (idx >= 0) this.waiters.splice(idx, 1)
+          reject(new Error(`Timed out waiting for capacity after ${timeoutMs}ms`))
+        }, timeoutMs)
+      }
+      this.waiters.push(waiter)
+    })
+  }
+
+  private release() {
+    this.inUse = Math.max(0, this.inUse - 1)
+    this.drain()
+  }
+
+  private drain() {
+    if (this.inUse >= this.capacity) return
+    const waiter = this.waiters.shift()
+    if (!waiter) return
+    if (waiter.timeoutId) clearTimeout(waiter.timeoutId)
+    this.inUse++
+    waiter.resolve(() => this.release())
+  }
 }

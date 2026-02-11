@@ -2,7 +2,7 @@ import axios, { AxiosInstance } from 'axios';
 import UserAgent from 'user-agents';
 import pino from 'pino';
 import yn from 'yn';
-import { isPage, sleep, waitForRequests } from '@/lib/utils';
+import { AsyncSemaphore, isPage, sleep, waitForRequests } from '@/lib/utils';
 import * as cookie from 'cookie';
 import { randomUUID } from 'node:crypto';
 import { Solver } from '@2captcha/captcha-solver';
@@ -18,7 +18,24 @@ const cache = globalForSunoApi.sunoApiCache || new Map<string, SunoApi>();
 globalForSunoApi.sunoApiCache = cache;
 
 const logger = pino();
-export const DEFAULT_MODEL = 'chirp-v3-5';
+export const DEFAULT_MODEL = 'chirp-crow'; // v5 model (Sept 2025)
+
+const CAPTCHA_MAX_CONCURRENT =
+  Number.parseInt(process.env.SUNO_MAX_CONCURRENT_CAPTCHAS || '', 10) || 1;
+const CAPTCHA_MAX_QUEUE =
+  Number.parseInt(process.env.SUNO_MAX_QUEUED_CAPTCHAS || '', 10) || 20;
+const CAPTCHA_ACQUIRE_TIMEOUT_MS =
+  Number.parseInt(process.env.SUNO_CAPTCHA_ACQUIRE_TIMEOUT_MS || '', 10) || 240_000;
+
+const captchaSemaphore = new AsyncSemaphore(CAPTCHA_MAX_CONCURRENT, CAPTCHA_MAX_QUEUE);
+
+export function sunoApiHealth() {
+  return {
+    ok: true,
+    captcha_semaphore: captchaSemaphore.stats(),
+    defaults: { model: DEFAULT_MODEL },
+  };
+}
 
 export interface AudioInfo {
   id: string; // Unique identifier for the audio
@@ -266,7 +283,12 @@ class SunoApi {
       '--disable-features=site-per-process',
       '--disable-features=IsolateOrigins',
       '--disable-extensions',
-      '--disable-infobars'
+      '--disable-infobars',
+      '--disable-background-networking',
+      '--disable-popup-blocking',
+      '--disable-sync',
+      '--metrics-recording-only',
+      '--safebrowsing-disable-auto-update'
     ];
     // Check for GPU acceleration, as it is recommended to turn it off for Docker
     if (yn(process.env.BROWSER_DISABLE_GPU, { default: false }))
@@ -308,14 +330,107 @@ class SunoApi {
     if (!await this.captchaRequired())
       return null;
 
-    logger.info('CAPTCHA required. Launching browser...')
-    const browser = await this.launchBrowser();
-    const page = await browser.newPage();
-    await page.goto('https://suno.com/create', { referer: 'https://www.google.com/', waitUntil: 'domcontentloaded', timeout: 0 });
+    const acquireStart = Date.now();
+    logger.info({ sem: captchaSemaphore.stats() }, 'Waiting for captcha capacity');
+    const release = await captchaSemaphore.acquire({ timeoutMs: CAPTCHA_ACQUIRE_TIMEOUT_MS });
+    logger.info({ waited_ms: Date.now() - acquireStart, sem: captchaSemaphore.stats() }, 'Acquired captcha capacity');
+
+    try {
+      logger.info('CAPTCHA required. Launching browser...')
+      const browser = await this.launchBrowser();
+      let browserClosed = false;
+      const closeBrowser = async () => {
+        if (browserClosed) return;
+        browserClosed = true;
+        await browser.browser()?.close();
+      };
+
+      const createUiReadyTimeoutMs = Number.parseInt(process.env.CAPTCHA_UI_READY_TIMEOUT_MS || '', 10) || 120_000;
+      const gotoTimeoutMs = Number.parseInt(process.env.BROWSER_GOTO_TIMEOUT_MS || '', 10) || 60_000;
+
+      try {
+        // Navigation with retry logic
+        let page: Page | null = null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            page = await browser.newPage();
+            await page.goto('https://suno.com/create', {
+              referer: 'https://www.google.com/',
+              waitUntil: 'domcontentloaded',
+              timeout: gotoTimeoutMs
+            });
+            break;
+          } catch (e) {
+            logger.warn(`Navigation attempt ${attempt + 1} failed: ${e instanceof Error ? e.message : String(e)}`);
+            if (attempt === 2) throw e;
+            await page?.close().catch(() => {});
+            await sleep(2);
+          }
+        }
+        if (!page) throw new Error('Failed to create page after retries');
+
+    const pickLargest = async (locator: Locator): Promise<Locator | null> => {
+      const count = await locator.count();
+      let bestIndex = -1;
+      let bestArea = -1;
+      for (let i = 0; i < count; i++) {
+        const candidate = locator.nth(i);
+        if (!await candidate.isVisible())
+          continue;
+        const box = await candidate.boundingBox();
+        if (!box) continue;
+        const area = box.width * box.height;
+        if (area > bestArea) {
+          bestArea = area;
+          bestIndex = i;
+        }
+      }
+      return bestIndex >= 0 ? locator.nth(bestIndex) : null;
+    };
+
+    const waitForCreateReady = async (): Promise<void> => {
+      const deadline = Date.now() + createUiReadyTimeoutMs;
+      while (Date.now() < deadline) {
+        try {
+          const prompt = await pickLargest(
+            page.locator('.custom-textarea, textarea, [contenteditable="true"], [role="textbox"]')
+          );
+          const createButton = await pickLargest(
+            page.locator('button[aria-label="Create song"], button[aria-label*="Create"], button:has-text("Create")')
+          );
+          if (prompt && createButton) return;
+          await page.waitForTimeout(250);
+        } catch (e) {
+          if (page.isClosed()) throw e;
+          const msg = e instanceof Error ? e.message : String(e);
+          const isTransient =
+            msg.includes('Execution context was destroyed') ||
+            msg.includes('most likely because of a navigation') ||
+            msg.includes('Navigation') ||
+            msg.includes('Target closed') ||
+            msg.includes('has been closed') ||
+            msg.includes('frame was detached');
+          if (!isTransient) throw e;
+          await page.waitForTimeout(250);
+        }
+      }
+      throw new Error(`Timed out after ${createUiReadyTimeoutMs}ms`);
+    };
 
     logger.info('Waiting for Suno interface to load');
-    // await page.locator('.react-aria-GridList').waitFor({ timeout: 60000 });
-    await page.waitForResponse('**/api/project/**\\?**', { timeout: 60000 }); // wait for song list API call
+    try {
+      await waitForCreateReady();
+    } catch (e) {
+      const debugId = Date.now();
+      const debugDir = process.env.CAPTCHA_DEBUG_DIR || '/tmp';
+      const screenshotPath = path.join(debugDir, `suno-create-not-ready-${debugId}.png`);
+      const htmlPath = path.join(debugDir, `suno-create-not-ready-${debugId}.html`);
+      await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => {});
+      await fs.writeFile(htmlPath, await page.content()).catch(() => {});
+      throw new Error(
+        `Suno /create did not become ready within ${createUiReadyTimeoutMs}ms (url=${page.url()}). Debug saved: ${screenshotPath} ${htmlPath}. Original error: ${e instanceof Error ? e.message : String(e)}`
+      );
+    }
 
     if (this.ghostCursorEnabled)
       this.cursor = await createCursor(page);
@@ -323,19 +438,92 @@ class SunoApi {
     logger.info('Triggering the CAPTCHA');
     try {
       await page.getByLabel('Close').click({ timeout: 2000 }); // close all popups
-      // await this.click(page, { x: 318, y: 13 });
     } catch(e) {}
 
-    const textarea = page.locator('.custom-textarea');
-    await this.click(textarea);
-    await textarea.pressSequentially('Lorem ipsum', { delay: 80 });
-
-    const button = page.locator('button[aria-label="Create"]').locator('div.flex');
-    this.click(button);
-
+    const tokenTimeoutMs = Number.parseInt(process.env.CAPTCHA_TOKEN_TIMEOUT_MS || '', 10) || 180_000;
     const controller = new AbortController();
+    let settled = false;
+
+    const shutdown = async () => {
+      try { controller.abort(); } catch {}
+      try { await closeBrowser(); } catch {}
+    };
+
+    const findPromptInput = async (): Promise<Locator> => {
+      const strategies = [
+        page.locator('.custom-textarea'),
+        page.locator('textarea'),
+        page.locator('[contenteditable="true"]'),
+        page.locator('[role="textbox"]'),
+      ];
+      for (const strat of strategies) {
+        const picked = await pickLargest(strat);
+        if (picked) return picked;
+      }
+      throw new Error('Could not find a prompt input on https://suno.com/create (UI may have changed).');
+    };
+
+    const findCreateButton = async (): Promise<Locator> => {
+      const strategies = [
+        page.locator('button[aria-label="Create song"]'),
+        page.locator('button[aria-label*="Create"]'),
+        page.getByRole('button', { name: /^Create$/i }),
+        page.getByRole('button', { name: /Create/i }),
+      ];
+      for (const strat of strategies) {
+        const picked = await pickLargest(strat);
+        if (picked) return picked;
+      }
+      throw new Error('Could not find the Create button on https://suno.com/create (UI may have changed).');
+    };
+
+    const textarea = await findPromptInput();
+    await textarea.fill('Lorem ipsum');
+
+    const button = await findCreateButton();
+
+    let resolveToken!: (token: string) => void;
+    let rejectToken!: (err: Error) => void;
+    const tokenPromise = new Promise<string>((resolve, reject) => {
+      resolveToken = resolve;
+      rejectToken = reject;
+    });
+
+    const finishOk = async (token: string) => {
+      if (settled) return;
+      settled = true;
+      await shutdown();
+      resolveToken(token);
+    };
+
+    const finishErr = async (err: unknown) => {
+      if (settled) return;
+      settled = true;
+      await shutdown();
+      rejectToken(err instanceof Error ? err : new Error(String(err)));
+    };
+
+    const timeout = setTimeout(() => finishErr(new Error(`Timed out waiting for hCaptcha token after ${tokenTimeoutMs}ms`)), tokenTimeoutMs);
+
+    await page.route(/\/api\/generate\/v2\/?/, async (route: any) => {
+      try {
+        logger.info('hCaptcha token received. Closing browser');
+        await route.abort();
+        const request = route.request();
+        const auth = request.headers().authorization;
+        if (auth && auth.includes('Bearer '))
+          this.currentToken = auth.split('Bearer ').pop();
+        clearTimeout(timeout);
+        await finishOk(request.postDataJSON().token);
+      } catch(err) {
+        clearTimeout(timeout);
+        await finishErr(err);
+      }
+    });
+
+    // Start solving loop (do not await; it will stop when controller is aborted).
     new Promise<void>(async (resolve, reject) => {
-      const frame = page.frameLocator('iframe[title*="hCaptcha"]');
+      const frame = page.frameLocator('iframe[title*=\"hCaptcha\"]');
       const challenge = frame.locator('.challenge-container');
       try {
         let wait = true;
@@ -407,25 +595,38 @@ class SunoApi {
         else
           reject(e);
       }
-    }).catch(e => {
-      browser.browser()?.close();
-      throw e;
+    }).catch(async (e) => {
+      clearTimeout(timeout);
+      await finishErr(e);
     });
-    return (new Promise((resolve, reject) => {
-      page.route('**/api/generate/v2/**', async (route: any) => {
-        try {
-          logger.info('hCaptcha token received. Closing browser');
-          route.abort();
-          browser.browser()?.close();
-          controller.abort();
-          const request = route.request();
-          this.currentToken = request.headers().authorization.split('Bearer ').pop();
-          resolve(request.postDataJSON().token);
-        } catch(err) {
-          reject(err);
-        }
-      });
-    }));
+
+    // Ensure the Create button becomes enabled after filling a prompt.
+    const enabledDeadline = Date.now() + 10_000;
+    while (Date.now() < enabledDeadline) {
+      if (await button.isEnabled()) break;
+      await page.waitForTimeout(250);
+    }
+    if (!await button.isEnabled()) {
+      const debugId = Date.now();
+      const debugDir = process.env.CAPTCHA_DEBUG_DIR || '/tmp';
+      const screenshotPath = path.join(debugDir, `suno-create-disabled-${debugId}.png`);
+      const htmlPath = path.join(debugDir, `suno-create-disabled-${debugId}.html`);
+      await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => {});
+      await fs.writeFile(htmlPath, await page.content()).catch(() => {});
+      throw new Error(`Create button stayed disabled after filling prompt. Debug saved: ${screenshotPath} ${htmlPath}`);
+    }
+
+        // Trigger captcha by attempting a create.
+        await this.click(button);
+
+        return await tokenPromise;
+      } finally {
+        await closeBrowser().catch(() => {});
+      }
+    } finally {
+      release();
+      logger.info({ sem: captchaSemaphore.stats() }, 'Released captcha capacity');
+    }
   }
 
   /**
@@ -587,7 +788,10 @@ class SunoApi {
             make_instrumental: make_instrumental,
             wait_audio: wait_audio,
             negative_tags: negative_tags,
-            payload: payload
+            payload: {
+              ...payload,
+              token: payload.token ? '<redacted>' : payload.token,
+            }
           },
           null,
           2
