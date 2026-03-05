@@ -29,6 +29,19 @@ const CAPTCHA_ACQUIRE_TIMEOUT_MS =
 
 const captchaSemaphore = new AsyncSemaphore(CAPTCHA_MAX_CONCURRENT, CAPTCHA_MAX_QUEUE);
 
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return await promise;
+  let timeoutId: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<T>((_resolve, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(`Timed out in ${label} after ${timeoutMs}ms`)), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+}
+
 export function sunoApiHealth() {
   return {
     ok: true,
@@ -345,7 +358,8 @@ class SunoApi {
         await browser.browser()?.close();
       };
 
-      const createUiReadyTimeoutMs = Number.parseInt(process.env.CAPTCHA_UI_READY_TIMEOUT_MS || '', 10) || 120_000;
+      // Default raised from 120s -> 180s to reduce false negatives when Suno UI is slow.
+      const createUiReadyTimeoutMs = Number.parseInt(process.env.CAPTCHA_UI_READY_TIMEOUT_MS || '', 10) || 180_000;
       const gotoTimeoutMs = Number.parseInt(process.env.BROWSER_GOTO_TIMEOUT_MS || '', 10) || 60_000;
 
       try {
@@ -419,14 +433,18 @@ class SunoApi {
 
     logger.info('Waiting for Suno interface to load');
     try {
-      await waitForCreateReady();
+      const readyPromise = waitForCreateReady();
+      // If we hit our own timeout below, avoid an unhandled rejection from the still-running promise.
+      readyPromise.catch(() => {});
+      await withTimeout(readyPromise, createUiReadyTimeoutMs + 5_000, "waitForCreateReady");
     } catch (e) {
       const debugId = Date.now();
       const debugDir = process.env.CAPTCHA_DEBUG_DIR || '/tmp';
       const screenshotPath = path.join(debugDir, `suno-create-not-ready-${debugId}.png`);
       const htmlPath = path.join(debugDir, `suno-create-not-ready-${debugId}.html`);
-      await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => {});
-      await fs.writeFile(htmlPath, await page.content()).catch(() => {});
+      await withTimeout(page.screenshot({ path: screenshotPath, fullPage: true }), 15_000, "page.screenshot").catch(() => {});
+      const html = await withTimeout(page.content(), 15_000, "page.content").catch(() => "");
+      if (html) await fs.writeFile(htmlPath, html).catch(() => {});
       throw new Error(
         `Suno /create did not become ready within ${createUiReadyTimeoutMs}ms (url=${page.url()}). Debug saved: ${screenshotPath} ${htmlPath}. Original error: ${e instanceof Error ? e.message : String(e)}`
       );

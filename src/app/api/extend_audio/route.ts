@@ -34,12 +34,22 @@ export async function POST(req: NextRequest) {
     } catch (error: any) {
       const rawDetail = error?.response?.data?.detail || error?.message || error?.toString?.() || 'Unknown error';
       const detail = typeof rawDetail === 'string' ? rawDetail : JSON.stringify(rawDetail);
+      const detailLower = detail.toLowerCase();
       let status = error?.response?.status || 500;
+      const isCreateUiOutage =
+        detailLower.includes('suno /create did not become ready') ||
+        detailLower.includes('https://suno.com/create') ||
+        detailLower.includes('timed out waiting for hcaptcha token') ||
+        detailLower.includes('no hcaptcha request occurred within') ||
+        detailLower.includes('timed out in waitforcreateready');
       if (
         status === 500 &&
         (detail.includes('Server busy') || detail.includes('Timed out waiting for capacity'))
       ) {
         status = 429;
+      }
+      if (status === 500 && isCreateUiOutage) {
+        status = 503;
       }
       console.error('Error extend audio:', status, detail);
       return new NextResponse(JSON.stringify({ error: detail }), {
@@ -47,6 +57,7 @@ export async function POST(req: NextRequest) {
         headers: {
           'Content-Type': 'application/json',
           ...(status === 429 ? { 'Retry-After': '15' } : {}),
+          ...(status === 503 ? { 'Retry-After': '60' } : {}),
           ...corsHeaders
         }
       });
