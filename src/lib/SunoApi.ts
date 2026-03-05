@@ -599,12 +599,16 @@ class SunoApi {
               await this.click(challenge, { x: +data.x, y: +data.y });
             };
           }
-          this.click(frame.locator('.button-submit')).catch(e => {
-            if (e.message.includes('viewport')) // when hCaptcha window has been closed due to inactivity,
-              this.click(button); // click the Create button again to trigger the CAPTCHA
-            else
+          try {
+            await this.click(frame.locator('.button-submit'));
+          } catch (e: any) {
+            // when hCaptcha window has been closed due to inactivity, retry by clicking Create again
+            if (e?.message?.includes('viewport')) {
+              await this.click(button);
+            } else {
               throw e;
-          });
+            }
+          }
         }
       } catch(e: any) {
         if (e.message.includes('been closed') // catch error when closing the browser
