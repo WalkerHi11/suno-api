@@ -347,7 +347,11 @@ class SunoApi {
       args,
       headless: yn(process.env.BROWSER_HEADLESS, { default: true })
     });
-    const context = await browser.newContext({ userAgent: this.userAgent, locale: process.env.BROWSER_LOCALE, viewport: null });
+    const context = await browser.newContext({
+      userAgent: this.userAgent,
+      locale: process.env.BROWSER_LOCALE || 'en',
+      viewport: null
+    });
     const cookies = [];
     const lax: 'Lax' | 'Strict' | 'None' = 'Lax';
     cookies.push({
