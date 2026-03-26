@@ -407,7 +407,12 @@ class SunoApi {
               const w = window as any;
               w.__cfTurnstileCaptured = null;
               w.__cfTurnstileCallback = null;
+              w.__hCaptchaCaptured = null;
+              w.__hCaptchaCallback = null;
+              w.__hCaptchaExecuted = false;
               let turnstileValue: any = undefined;
+              let hcaptchaValue: any = undefined;
+              let grecaptchaValue: any = undefined;
 
               const installHook = (ts: any) => {
                 if (!ts || ts.__sunoHooked)
@@ -433,6 +438,38 @@ class SunoApi {
                 return true;
               };
 
+              const installHCaptchaHook = (captcha: any) => {
+                if (!captcha || captcha.__sunoHCaptchaHooked)
+                  return false;
+
+                const originalRender = captcha.render?.bind(captcha);
+                if (typeof originalRender === 'function') {
+                  captcha.render = (...args: any[]) => {
+                    const [, options] = args;
+                    w.__hCaptchaCaptured = {
+                      sitekey: options?.sitekey,
+                      pageurl: window.location.href,
+                      invisible: options?.size === 'invisible' ? 1 : 0,
+                      data: options?.rqdata,
+                      userAgent: navigator.userAgent,
+                    };
+                    w.__hCaptchaCallback = options?.callback ?? null;
+                    return originalRender(...args);
+                  };
+                }
+
+                const originalExecute = captcha.execute?.bind(captcha);
+                if (typeof originalExecute === 'function') {
+                  captcha.execute = (...args: any[]) => {
+                    w.__hCaptchaExecuted = true;
+                    return originalExecute(...args);
+                  };
+                }
+
+                captcha.__sunoHCaptchaHooked = true;
+                return true;
+              };
+
               Object.defineProperty(w, 'turnstile', {
                 configurable: true,
                 get() {
@@ -444,8 +481,34 @@ class SunoApi {
                 },
               });
 
+              Object.defineProperty(w, 'hcaptcha', {
+                configurable: true,
+                get() {
+                  return hcaptchaValue;
+                },
+                set(value) {
+                  hcaptchaValue = value;
+                  installHCaptchaHook(value);
+                },
+              });
+
+              Object.defineProperty(w, 'grecaptcha', {
+                configurable: true,
+                get() {
+                  return grecaptchaValue;
+                },
+                set(value) {
+                  grecaptchaValue = value;
+                  installHCaptchaHook(value);
+                },
+              });
+
               if (w.turnstile)
                 installHook(w.turnstile);
+              if (w.hcaptcha)
+                installHCaptchaHook(w.hcaptcha);
+              if (w.grecaptcha)
+                installHCaptchaHook(w.grecaptcha);
             });
             await page.goto('https://suno.com/create', {
               referer: 'https://www.google.com/',
@@ -582,7 +645,22 @@ class SunoApi {
     const waitForTurnstileParams = async (timeoutMs: number) => {
       const deadline = Date.now() + timeoutMs;
       while (Date.now() < deadline) {
-        const params = await page.evaluate(() => (window as any).__cfTurnstileCaptured ?? null);
+        let params: any;
+        try {
+          params = await page.evaluate(() => (window as any).__cfTurnstileCaptured ?? null);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          const isTransient =
+            msg.includes('Execution context was destroyed') ||
+            msg.includes('most likely because of a navigation') ||
+            msg.includes('Navigation') ||
+            msg.includes('Target closed') ||
+            msg.includes('has been closed') ||
+            msg.includes('frame was detached');
+          if (!isTransient) throw e;
+          await page.waitForTimeout(250);
+          continue;
+        }
         if (params?.sitekey)
           return params;
         await page.waitForTimeout(250);
@@ -635,6 +713,97 @@ class SunoApi {
       return true;
     };
 
+    const waitForHCaptchaParams = async (timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        let params: any;
+        try {
+          params = await page.evaluate(() => {
+            const w = window as any;
+            if (!w.__hCaptchaCaptured?.sitekey)
+              return null;
+            return {
+              ...w.__hCaptchaCaptured,
+              executed: Boolean(w.__hCaptchaExecuted),
+            };
+          });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          const isTransient =
+            msg.includes('Execution context was destroyed') ||
+            msg.includes('most likely because of a navigation') ||
+            msg.includes('Navigation') ||
+            msg.includes('Target closed') ||
+            msg.includes('has been closed') ||
+            msg.includes('frame was detached');
+          if (!isTransient) throw e;
+          await page.waitForTimeout(250);
+          continue;
+        }
+        if (params?.sitekey)
+          return params;
+        await page.waitForTimeout(250);
+      }
+      return null;
+    };
+
+    const solveHCaptchaToken = async (): Promise<boolean> => {
+      const params = await waitForHCaptchaParams(20_000);
+      if (!params)
+        return false;
+
+      logger.info(
+        {
+          sitekey: params.sitekey,
+          invisible: Boolean(params.invisible),
+          executed: Boolean(params.executed),
+          has_data: Boolean(params.data),
+        },
+        'Solving hCaptcha token'
+      );
+
+      const payload: Record<string, unknown> = {
+        pageurl: params.pageurl || page.url(),
+        sitekey: params.sitekey,
+        invisible: params.invisible ? 1 : 0,
+      };
+      if (params.data) {
+        payload.data = params.data;
+        payload.userAgent = params.userAgent || this.userAgent;
+      } else if (params.userAgent) {
+        payload.userAgent = params.userAgent;
+      }
+
+      const result: any = await (this.solver as any).hcaptcha(payload);
+      const token = result?.data;
+      if (!token)
+        throw new Error('hCaptcha solver returned no token');
+
+      await page.evaluate((captchaToken: string) => {
+        const w = window as any;
+        const selectors = [
+          'input[name="h-captcha-response"]',
+          'textarea[name="h-captcha-response"]',
+          'input[name="g-recaptcha-response"]',
+          'textarea[name="g-recaptcha-response"]',
+        ];
+        for (const selector of selectors) {
+          const el = document.querySelector(selector) as HTMLInputElement | HTMLTextAreaElement | null;
+          if (!el)
+            continue;
+          el.value = captchaToken;
+          el.innerHTML = captchaToken;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        if (typeof w.__hCaptchaCallback === 'function')
+          w.__hCaptchaCallback(captchaToken);
+      }, token);
+
+      logger.info('hCaptcha token injected');
+      return true;
+    };
+
     let resolveToken!: (token: string) => void;
     let rejectToken!: (err: Error) => void;
     const tokenPromise = new Promise<string>((resolve, reject) => {
@@ -674,10 +843,10 @@ class SunoApi {
       }
     });
 
-    const solveHCaptcha = async () => {
+    const solveHCaptchaChallenge = async () => {
       const frame = page.frameLocator(
-        'iframe[title*="hCaptcha"], iframe[src*="hcaptcha"], iframe[src*="challenge-platform"]'
-      );
+        'iframe[title*="hCaptcha challenge"], iframe[src*="hcaptcha"][src*="frame=challenge"], iframe[src*="challenge-platform"]'
+      ).first();
       const challenge = frame.locator('.challenge-container');
       let wait = true;
       while (true) {
@@ -769,11 +938,23 @@ class SunoApi {
         try {
           const solvedTurnstile = await solveTurnstile();
           if (!solvedTurnstile) {
-            logger.info('No Turnstile params detected after Create; falling back to hCaptcha solver');
-            solveHCaptcha().catch(async (e) => {
-              clearTimeout(timeout);
-              await finishErr(e);
-            });
+            let solvedHCaptchaToken = false;
+            try {
+              solvedHCaptchaToken = await solveHCaptchaToken();
+            } catch (e) {
+              logger.warn(
+                { error: e instanceof Error ? e.message : String(e) },
+                'hCaptcha token solve failed; falling back to interactive challenge'
+              );
+            }
+
+            if (!solvedHCaptchaToken) {
+              logger.info('No token-based captcha params detected after Create; falling back to interactive hCaptcha solver');
+              solveHCaptchaChallenge().catch(async (e) => {
+                clearTimeout(timeout);
+                await finishErr(e);
+              });
+            }
           }
         } catch (e) {
           clearTimeout(timeout);
