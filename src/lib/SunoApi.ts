@@ -407,9 +407,9 @@ class SunoApi {
               const w = window as any;
               w.__cfTurnstileCaptured = null;
               w.__cfTurnstileCallback = null;
+              let turnstileValue: any = undefined;
 
-              const installHook = () => {
-                const ts = w.turnstile;
+              const installHook = (ts: any) => {
                 if (!ts || ts.__sunoHooked)
                   return false;
                 const originalRender = ts.render?.bind(ts);
@@ -433,12 +433,19 @@ class SunoApi {
                 return true;
               };
 
-              if (!installHook()) {
-                const interval = setInterval(() => {
-                  if (installHook())
-                    clearInterval(interval);
-                }, 50);
-              }
+              Object.defineProperty(w, 'turnstile', {
+                configurable: true,
+                get() {
+                  return turnstileValue;
+                },
+                set(value) {
+                  turnstileValue = value;
+                  installHook(value);
+                },
+              });
+
+              if (w.turnstile)
+                installHook(w.turnstile);
             });
             await page.goto('https://suno.com/create', {
               referer: 'https://www.google.com/',
