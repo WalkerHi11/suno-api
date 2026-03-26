@@ -403,6 +403,43 @@ class SunoApi {
         for (let attempt = 0; attempt < 3; attempt++) {
           try {
             page = await browser.newPage();
+            await page.addInitScript(() => {
+              const w = window as any;
+              w.__cfTurnstileCaptured = null;
+              w.__cfTurnstileCallback = null;
+
+              const installHook = () => {
+                const ts = w.turnstile;
+                if (!ts || ts.__sunoHooked)
+                  return false;
+                const originalRender = ts.render?.bind(ts);
+                if (typeof originalRender !== 'function')
+                  return false;
+                ts.render = (...args: any[]) => {
+                  const [, options] = args;
+                  w.__cfTurnstileCaptured = {
+                    sitekey: options?.sitekey,
+                    pageurl: window.location.href,
+                    data: options?.cData,
+                    pagedata: options?.chlPageData,
+                    action: options?.action,
+                    userAgent: navigator.userAgent,
+                    json: 1,
+                  };
+                  w.__cfTurnstileCallback = options?.callback ?? null;
+                  return originalRender(...args);
+                };
+                ts.__sunoHooked = true;
+                return true;
+              };
+
+              if (!installHook()) {
+                const interval = setInterval(() => {
+                  if (installHook())
+                    clearInterval(interval);
+                }, 50);
+              }
+            });
             await page.goto('https://suno.com/create', {
               referer: 'https://www.google.com/',
               waitUntil: 'domcontentloaded',
@@ -535,6 +572,62 @@ class SunoApi {
 
     const button = await findCreateButton();
 
+    const waitForTurnstileParams = async (timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const params = await page.evaluate(() => (window as any).__cfTurnstileCaptured ?? null);
+        if (params?.sitekey)
+          return params;
+        await page.waitForTimeout(250);
+      }
+      return null;
+    };
+
+    const solveTurnstile = async (): Promise<boolean> => {
+      const params = await waitForTurnstileParams(15_000);
+      if (!params)
+        return false;
+
+      logger.info(
+        {
+          sitekey: params.sitekey,
+          action: params.action,
+          has_data: Boolean(params.data),
+          has_pagedata: Boolean(params.pagedata),
+        },
+        'Solving Cloudflare Turnstile'
+      );
+
+      const result: any = await (this.solver as any).cloudflareTurnstile(params);
+      const token = result?.data;
+      if (!token)
+        throw new Error('Cloudflare Turnstile solver returned no token');
+
+      await page.evaluate((turnstileToken: string) => {
+        const w = window as any;
+        if (typeof w.__cfTurnstileCallback === 'function')
+          w.__cfTurnstileCallback(turnstileToken);
+
+        const selectors = [
+          'input[name="cf-turnstile-response"]',
+          'textarea[name="cf-turnstile-response"]',
+          'input[name="g-recaptcha-response"]',
+          'textarea[name="g-recaptcha-response"]',
+        ];
+        for (const selector of selectors) {
+          const el = document.querySelector(selector) as HTMLInputElement | HTMLTextAreaElement | null;
+          if (!el)
+            continue;
+          el.value = turnstileToken;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }, token);
+
+      logger.info('Cloudflare Turnstile token injected');
+      return true;
+    };
+
     let resolveToken!: (token: string) => void;
     let rejectToken!: (err: Error) => void;
     const tokenPromise = new Promise<string>((resolve, reject) => {
@@ -574,90 +667,78 @@ class SunoApi {
       }
     });
 
-    // Start solving loop (do not await; it will stop when controller is aborted).
-    new Promise<void>(async (resolve, reject) => {
+    const solveHCaptcha = async () => {
       const frame = page.frameLocator(
         'iframe[title*="hCaptcha"], iframe[src*="hcaptcha"], iframe[src*="challenge-platform"]'
       );
       const challenge = frame.locator('.challenge-container');
-      try {
-        let wait = true;
-        while (true) {
-          if (wait)
-            await waitForRequests(page, controller.signal);
-          const drag = (await challenge.locator('.prompt-text').first().innerText()).toLowerCase().includes('drag');
-          let captcha: any;
-          for (let j = 0; j < 3; j++) { // try several times because sometimes 2Captcha could return an error
-            try {
-              logger.info('Sending the CAPTCHA to 2Captcha');
-              const payload: paramsCoordinates = {
-                body: (await challenge.screenshot({ timeout: 5000 })).toString('base64'),
-                lang: process.env.BROWSER_LOCALE
-              };
-              if (drag) {
-                // Say to the worker that he needs to click
-                payload.textinstructions = 'CLICK on the shapes at their edge or center as shown above—please be precise!';
-                payload.imginstructions = (await fs.readFile(path.join(process.cwd(), 'public', 'drag-instructions.jpg'))).toString('base64');
-              }
-              captcha = await this.solver.coordinates(payload);
-              break;
-            } catch(err: any) {
-              logger.info(err.message);
-              if (j != 2)
-                logger.info('Retrying...');
-              else
-                throw err;
-            }
-          } 
-          if (drag) {
-            const challengeBox = await challenge.boundingBox();
-            if (challengeBox == null)
-              throw new Error('.challenge-container boundingBox is null!');
-            if (captcha.data.length % 2) {
-              logger.info('Solution does not have even amount of points required for dragging. Requesting new solution...');
-              this.solver.badReport(captcha.id);
-              wait = false;
-              continue;
-            }
-            for (let i = 0; i < captcha.data.length; i += 2) {
-              const data1 = captcha.data[i];
-              const data2 = captcha.data[i+1];
-              logger.info(JSON.stringify(data1) + JSON.stringify(data2));
-              await page.mouse.move(challengeBox.x + +data1.x, challengeBox.y + +data1.y);
-              await page.mouse.down();
-              await sleep(1.1); // wait for the piece to be 'unlocked'
-              await page.mouse.move(challengeBox.x + +data2.x, challengeBox.y + +data2.y, { steps: 30 });
-              await page.mouse.up();
-            }
-            wait = true;
-          } else {
-            for (const data of captcha.data) {
-              logger.info(data);
-              await this.click(challenge, { x: +data.x, y: +data.y });
-            };
-          }
+      let wait = true;
+      while (true) {
+        if (wait)
+          await waitForRequests(page, controller.signal);
+        const drag = (await challenge.locator('.prompt-text').first().innerText()).toLowerCase().includes('drag');
+        let captcha: any;
+        for (let j = 0; j < 3; j++) { // try several times because sometimes 2Captcha could return an error
           try {
-            await this.click(frame.locator('.button-submit'));
-          } catch (e: any) {
-            // when hCaptcha window has been closed due to inactivity, retry by clicking Create again
-            if (e?.message?.includes('viewport')) {
-              await this.click(button);
-            } else {
-              throw e;
+            logger.info('Sending the CAPTCHA to 2Captcha');
+            const payload: paramsCoordinates = {
+              body: (await challenge.screenshot({ timeout: 5000 })).toString('base64'),
+              lang: process.env.BROWSER_LOCALE
+            };
+            if (drag) {
+              // Say to the worker that he needs to click
+              payload.textinstructions = 'CLICK on the shapes at their edge or center as shown above—please be precise!';
+              payload.imginstructions = (await fs.readFile(path.join(process.cwd(), 'public', 'drag-instructions.jpg'))).toString('base64');
             }
+            captcha = await this.solver.coordinates(payload);
+            break;
+          } catch(err: any) {
+            logger.info(err.message);
+            if (j != 2)
+              logger.info('Retrying...');
+            else
+              throw err;
+          }
+        } 
+        if (drag) {
+          const challengeBox = await challenge.boundingBox();
+          if (challengeBox == null)
+            throw new Error('.challenge-container boundingBox is null!');
+          if (captcha.data.length % 2) {
+            logger.info('Solution does not have even amount of points required for dragging. Requesting new solution...');
+            this.solver.badReport(captcha.id);
+            wait = false;
+            continue;
+          }
+          for (let i = 0; i < captcha.data.length; i += 2) {
+            const data1 = captcha.data[i];
+            const data2 = captcha.data[i+1];
+            logger.info(JSON.stringify(data1) + JSON.stringify(data2));
+            await page.mouse.move(challengeBox.x + +data1.x, challengeBox.y + +data1.y);
+            await page.mouse.down();
+            await sleep(1.1); // wait for the piece to be 'unlocked'
+            await page.mouse.move(challengeBox.x + +data2.x, challengeBox.y + +data2.y, { steps: 30 });
+            await page.mouse.up();
+          }
+          wait = true;
+        } else {
+          for (const data of captcha.data) {
+            logger.info(data);
+            await this.click(challenge, { x: +data.x, y: +data.y });
+          };
+        }
+        try {
+          await this.click(frame.locator('.button-submit'));
+        } catch (e: any) {
+          // when hCaptcha window has been closed due to inactivity, retry by clicking Create again
+          if (e?.message?.includes('viewport')) {
+            await this.click(button);
+          } else {
+            throw e;
           }
         }
-      } catch(e: any) {
-        if (e.message.includes('been closed') // catch error when closing the browser
-          || e.message == 'AbortError') // catch error when waitForRequests is aborted
-          resolve();
-        else
-          reject(e);
       }
-    }).catch(async (e) => {
-      clearTimeout(timeout);
-      await finishErr(e);
-    });
+    };
 
     // Ensure the Create button becomes enabled after filling a prompt.
     const enabledDeadline = Date.now() + 10_000;
@@ -677,6 +758,20 @@ class SunoApi {
 
         // Trigger captcha by attempting a create.
         await this.click(button);
+
+        try {
+          const solvedTurnstile = await solveTurnstile();
+          if (!solvedTurnstile) {
+            logger.info('No Turnstile params detected after Create; falling back to hCaptcha solver');
+            solveHCaptcha().catch(async (e) => {
+              clearTimeout(timeout);
+              await finishErr(e);
+            });
+          }
+        } catch (e) {
+          clearTimeout(timeout);
+          await finishErr(e);
+        }
 
         return await tokenPromise;
       } finally {
