@@ -35,19 +35,74 @@ export const isPage = (target: any): target is Page => {
  * @param signal `const controller = new AbortController(); controller.status`
  * @returns {Promise<void>} 
  */
+const CAPTCHA_FRAME_SELECTOR =
+  'iframe[title*="hCaptcha"], iframe[src*="hcaptcha"], iframe[src*="challenge-platform"]';
+
+async function captchaFrameVisible(page: Page): Promise<boolean> {
+  const frames = page.locator(CAPTCHA_FRAME_SELECTOR);
+  const count = await frames.count().catch(() => 0);
+  for (let i = 0; i < count; i++) {
+    const frame = frames.nth(i);
+    if (!await frame.isVisible().catch(() => false))
+      continue;
+    const box = await frame.boundingBox().catch(() => null);
+    if (box && box.width > 0 && box.height > 0)
+      return true;
+  }
+  return false;
+}
+
 export const waitForRequests = (page: Page, signal: AbortSignal): Promise<void> => {
   return new Promise((resolve, reject) => {
-    const urlPattern =
-      /^https:\/\/(?:img[a-zA-Z0-9-]*\.hcaptcha\.com|hcaptcha-imgs[a-zA-Z0-9-]*\.suno\.com)\/.*$/;
+    const isCaptchaRequest = (urlString: string): boolean => {
+      try {
+        const url = new URL(urlString);
+        const hostname = url.hostname.toLowerCase();
+        const pathname = url.pathname.toLowerCase();
+        if (hostname.includes("hcaptcha"))
+          return true;
+        if (hostname.includes("challenge-platform"))
+          return true;
+        if (hostname.endsWith(".suno.com") && hostname.startsWith("hcaptcha-"))
+          return true;
+        if (hostname.endsWith(".suno.com") && pathname.includes("/api/challenge/"))
+          return true;
+        return false;
+      } catch {
+        return false;
+      }
+    };
     let timeoutHandle: NodeJS.Timeout | null = null;
     let initialTimeout: NodeJS.Timeout | null = null;
+    let domPollHandle: NodeJS.Timeout | null = null;
     let activeRequestCount = 0;
     let requestOccurred = false;
+    let settled = false;
 
     const cleanupListeners = () => {
       page.off('request', onRequest);
       page.off('requestfinished', onRequestFinished);
       page.off('requestfailed', onRequestFinished);
+      if (initialTimeout)
+        clearTimeout(initialTimeout);
+      if (timeoutHandle)
+        clearTimeout(timeoutHandle);
+      if (domPollHandle)
+        clearInterval(domPollHandle);
+    };
+
+    const finishResolve = () => {
+      if (settled) return;
+      settled = true;
+      cleanupListeners();
+      resolve();
+    };
+
+    const finishReject = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanupListeners();
+      reject(err);
     };
 
     const resetTimeout = () => {
@@ -55,14 +110,13 @@ export const waitForRequests = (page: Page, signal: AbortSignal): Promise<void> 
         clearTimeout(timeoutHandle);
       if (activeRequestCount === 0) {
         timeoutHandle = setTimeout(() => {
-          cleanupListeners();
-          resolve();
+          finishResolve();
         }, 1000); // 1 second of no requests
       }
     };
 
     const onRequest = (request: { url: () => string }) => {
-      if (urlPattern.test(request.url())) {
+      if (isCaptchaRequest(request.url())) {
         requestOccurred = true;
         activeRequestCount++;
         if (timeoutHandle)
@@ -75,7 +129,7 @@ export const waitForRequests = (page: Page, signal: AbortSignal): Promise<void> 
     };
 
     const onRequestFinished = (request: { url: () => string }) => {
-      if (urlPattern.test(request.url())) {
+      if (isCaptchaRequest(request.url())) {
         activeRequestCount--;
         resetTimeout();
       }
@@ -85,8 +139,7 @@ export const waitForRequests = (page: Page, signal: AbortSignal): Promise<void> 
     const initialWaitMs = Number.parseInt(process.env.CAPTCHA_INITIAL_WAIT_MS || '', 10) || 120000;
     initialTimeout = setTimeout(() => {
       if (!requestOccurred) {
-        cleanupListeners();
-        reject(new Error(`No hCaptcha request occurred within ${initialWaitMs / 1000} seconds.`));
+        finishReject(new Error(`No hCaptcha request occurred within ${initialWaitMs / 1000} seconds.`));
       } else {
         // Start waiting for no hCaptcha requests
         resetTimeout();
@@ -97,14 +150,27 @@ export const waitForRequests = (page: Page, signal: AbortSignal): Promise<void> 
     page.on('requestfinished', onRequestFinished);
     page.on('requestfailed', onRequestFinished);
 
+    // Modern Suno often preloads the captcha iframe/widget before the Create click,
+    // so network-only detection can miss a ready challenge.
+    domPollHandle = setInterval(() => {
+      captchaFrameVisible(page)
+        .then((visible) => {
+          if (visible)
+            finishResolve();
+        })
+        .catch(() => undefined);
+    }, 250);
+
+    captchaFrameVisible(page)
+      .then((visible) => {
+        if (visible)
+          finishResolve();
+      })
+      .catch(() => undefined);
+
     const onAbort = () => {
-      cleanupListeners();
-      if (initialTimeout)
-        clearTimeout(initialTimeout);
-      if (timeoutHandle)
-        clearTimeout(timeoutHandle);
       signal.removeEventListener('abort', onAbort);
-      reject(new Error('AbortError'));
+      finishReject(new Error('AbortError'));
     };
 
     signal.addEventListener('abort', onAbort, { once: true });

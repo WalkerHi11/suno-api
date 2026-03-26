@@ -26,6 +26,8 @@ const CAPTCHA_MAX_QUEUE =
   Number.parseInt(process.env.SUNO_MAX_QUEUED_CAPTCHAS || '', 10) || 20;
 const CAPTCHA_ACQUIRE_TIMEOUT_MS =
   Number.parseInt(process.env.SUNO_CAPTCHA_ACQUIRE_TIMEOUT_MS || '', 10) || 240_000;
+const TRANSIENT_CREATE_RETRIES =
+  Number.parseInt(process.env.SUNO_TRANSIENT_CREATE_RETRIES || '', 10) || 1;
 
 const captchaSemaphore = new AsyncSemaphore(CAPTCHA_MAX_CONCURRENT, CAPTCHA_MAX_QUEUE);
 
@@ -231,6 +233,39 @@ class SunoApi {
       }
     );
     return tokenResponse.data.session_id;
+  }
+
+  private isTransientCreateError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return [
+      'Execution context was destroyed',
+      'most likely because of a navigation',
+      'Target closed',
+      'frame was detached',
+      'has been closed'
+    ].some((snippet) => message.includes(snippet));
+  }
+
+  private async withTransientCreateRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await fn();
+      } catch (error) {
+        if (attempt >= TRANSIENT_CREATE_RETRIES || !this.isTransientCreateError(error)) {
+          throw error;
+        }
+        logger.warn(
+          {
+            label,
+            attempt: attempt + 1,
+            max_retries: TRANSIENT_CREATE_RETRIES,
+            error: error instanceof Error ? error.message : String(error)
+          },
+          'Retrying transient Suno create flow error'
+        );
+        await sleep(2, 3);
+      }
+    }
   }
 
   private async captchaRequired(): Promise<boolean> {
@@ -541,7 +576,9 @@ class SunoApi {
 
     // Start solving loop (do not await; it will stop when controller is aborted).
     new Promise<void>(async (resolve, reject) => {
-      const frame = page.frameLocator('iframe[title*=\"hCaptcha\"]');
+      const frame = page.frameLocator(
+        'iframe[title*="hCaptcha"], iframe[src*="hcaptcha"], iframe[src*="challenge-platform"]'
+      );
       const challenge = frame.locator('.challenge-container');
       try {
         let wait = true;
@@ -676,14 +713,17 @@ class SunoApi {
   ): Promise<AudioInfo[]> {
     await this.keepAlive(false);
     const startTime = Date.now();
-    const audios = await this.generateSongs(
-      prompt,
-      false,
-      undefined,
-      undefined,
-      make_instrumental,
-      model,
-      wait_audio
+    const audios = await this.withTransientCreateRetry(
+      'generate',
+      () => this.generateSongs(
+        prompt,
+        false,
+        undefined,
+        undefined,
+        make_instrumental,
+        model,
+        wait_audio
+      )
     );
     const costTime = Date.now() - startTime;
     logger.info('Generate Response:\n' + JSON.stringify(audios, null, 2));
@@ -735,15 +775,18 @@ class SunoApi {
     negative_tags?: string
   ): Promise<AudioInfo[]> {
     const startTime = Date.now();
-    const audios = await this.generateSongs(
-      prompt,
-      true,
-      tags,
-      title,
-      make_instrumental,
-      model,
-      wait_audio,
-      negative_tags
+    const audios = await this.withTransientCreateRetry(
+      'custom_generate',
+      () => this.generateSongs(
+        prompt,
+        true,
+        tags,
+        title,
+        make_instrumental,
+        model,
+        wait_audio,
+        negative_tags
+      )
     );
     const costTime = Date.now() - startTime;
     logger.info(
@@ -919,7 +962,10 @@ class SunoApi {
     model?: string,
     wait_audio?: boolean
   ): Promise<AudioInfo[]> {
-    return this.generateSongs(prompt, true, tags, title, false, model, wait_audio, negative_tags, 'extend', audioId, continueAt);
+    return this.withTransientCreateRetry(
+      'extend_audio',
+      () => this.generateSongs(prompt, true, tags, title, false, model, wait_audio, negative_tags, 'extend', audioId, continueAt)
+    );
   }
 
   /**
