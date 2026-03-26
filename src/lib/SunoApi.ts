@@ -857,19 +857,15 @@ class SunoApi {
         try {
           const frames = page.locator(challengeFrameSelector);
           const count = await frames.count().catch(() => 0);
-          for (let i = 0; i < count; i++) {
-            const candidate = frames.nth(i);
-            const src = await candidate.getAttribute('src').catch(() => null);
-            const title = await candidate.getAttribute('title').catch(() => null);
-            if (!src && !title)
-              continue;
-
-            const challengeFrame = page.frame({ url: /hcaptcha.*frame=challenge/i });
-            if (challengeFrame) {
-              const ready = await challengeFrame.locator('.challenge-container').count().catch(() => 0);
-              if (ready > 0)
-                return;
-            }
+          if (count > 0) {
+            const ready = await page
+              .frameLocator(challengeFrameSelector)
+              .first()
+              .locator('.challenge-container')
+              .count()
+              .catch(() => 0);
+            if (ready > 0)
+              return;
           }
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
