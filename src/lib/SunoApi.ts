@@ -2,7 +2,7 @@ import axios, { AxiosInstance } from 'axios';
 import UserAgent from 'user-agents';
 import pino from 'pino';
 import yn from 'yn';
-import { AsyncSemaphore, isPage, sleep, waitForRequests } from '@/lib/utils';
+import { AsyncSemaphore, isPage, sleep } from '@/lib/utils';
 import * as cookie from 'cookie';
 import { randomUUID } from 'node:crypto';
 import { Solver } from '@2captcha/captcha-solver';
@@ -843,15 +843,59 @@ class SunoApi {
       }
     });
 
+    const challengeFrameSelector =
+      'iframe[title*="hCaptcha challenge"], iframe[src*="hcaptcha"][src*="frame=challenge"], iframe[src*="challenge-platform"]';
+
+    const waitForHCaptchaChallengeFrame = async () => {
+      const initialWaitMs = Number.parseInt(process.env.CAPTCHA_INITIAL_WAIT_MS || '', 10) || 120000;
+      const deadline = Date.now() + initialWaitMs;
+
+      while (Date.now() < deadline) {
+        if (controller.signal.aborted)
+          throw new Error('AbortError');
+
+        try {
+          const frames = page.locator(challengeFrameSelector);
+          const count = await frames.count().catch(() => 0);
+          for (let i = 0; i < count; i++) {
+            const candidate = frames.nth(i);
+            const src = await candidate.getAttribute('src').catch(() => null);
+            const title = await candidate.getAttribute('title').catch(() => null);
+            if (!src && !title)
+              continue;
+
+            const challengeFrame = page.frame({ url: /hcaptcha.*frame=challenge/i });
+            if (challengeFrame) {
+              const ready = await challengeFrame.locator('.challenge-container').count().catch(() => 0);
+              if (ready > 0)
+                return;
+            }
+          }
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          const isTransient =
+            msg.includes('Execution context was destroyed') ||
+            msg.includes('most likely because of a navigation') ||
+            msg.includes('Navigation') ||
+            msg.includes('Target closed') ||
+            msg.includes('has been closed') ||
+            msg.includes('frame was detached');
+          if (!isTransient) throw e;
+        }
+
+        await page.waitForTimeout(500);
+      }
+
+      throw new Error(`No hCaptcha request occurred within ${initialWaitMs / 1000} seconds.`);
+    };
+
     const solveHCaptchaChallenge = async () => {
-      const frame = page.frameLocator(
-        'iframe[title*="hCaptcha challenge"], iframe[src*="hcaptcha"][src*="frame=challenge"], iframe[src*="challenge-platform"]'
-      ).first();
+      const frame = page.frameLocator(challengeFrameSelector).first();
       const challenge = frame.locator('.challenge-container');
       let wait = true;
       while (true) {
         if (wait)
-          await waitForRequests(page, controller.signal);
+          await waitForHCaptchaChallengeFrame();
         const drag = (await challenge.locator('.prompt-text').first().innerText()).toLowerCase().includes('drag');
         let captcha: any;
         for (let j = 0; j < 3; j++) { // try several times because sometimes 2Captcha could return an error
