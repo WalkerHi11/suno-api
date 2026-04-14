@@ -18,7 +18,13 @@ const cache = globalForSunoApi.sunoApiCache || new Map<string, SunoApi>();
 globalForSunoApi.sunoApiCache = cache;
 
 const logger = pino();
-export const DEFAULT_MODEL = 'chirp-crow'; // v5 model (Sept 2025)
+// Keep the default model overridable from env so MCP callers can track Suno model updates
+// without patching source again.
+export const DEFAULT_MODEL = process.env.SUNO_DEFAULT_MODEL || 'v5.5';
+const DEFAULT_USE_PERSONA = yn(process.env.SUNO_DEFAULT_USE_PERSONA, { default: false }) ?? false;
+const DEFAULT_PERSONA_NAME = process.env.SUNO_DEFAULT_PERSONA_NAME || '';
+const DEFAULT_PERSONA_ID = process.env.SUNO_DEFAULT_PERSONA_ID || '';
+const DEFAULT_TASK = process.env.SUNO_DEFAULT_TASK || '';
 
 const CAPTCHA_MAX_CONCURRENT =
   Number.parseInt(process.env.SUNO_MAX_CONCURRENT_CAPTCHAS || '', 10) || 1;
@@ -28,6 +34,14 @@ const CAPTCHA_ACQUIRE_TIMEOUT_MS =
   Number.parseInt(process.env.SUNO_CAPTCHA_ACQUIRE_TIMEOUT_MS || '', 10) || 240_000;
 const TRANSIENT_CREATE_RETRIES =
   Number.parseInt(process.env.SUNO_TRANSIENT_CREATE_RETRIES || '', 10) || 1;
+const CAPTCHA_SKIP_HCAPTCHA_TOKEN_SOLVE =
+  yn(process.env.SUNO_SKIP_HCAPTCHA_TOKEN_SOLVE, { default: false }) ?? false;
+const CAPTCHA_MAX_CHALLENGE_ROUNDS =
+  Number.parseInt(process.env.CAPTCHA_MAX_CHALLENGE_ROUNDS || '', 10) || 12;
+const CAPTCHA_POST_SUBMIT_WAIT_MS =
+  Number.parseInt(process.env.CAPTCHA_POST_SUBMIT_WAIT_MS || '', 10) || 4_000;
+const CAPTCHA_REFRESH_AFTER_ROUNDS =
+  Number.parseInt(process.env.CAPTCHA_REFRESH_AFTER_ROUNDS || '', 10) || 3;
 
 const captchaSemaphore = new AsyncSemaphore(CAPTCHA_MAX_CONCURRENT, CAPTCHA_MAX_QUEUE);
 
@@ -48,7 +62,13 @@ export function sunoApiHealth() {
   return {
     ok: true,
     captcha_semaphore: captchaSemaphore.stats(),
-    defaults: { model: DEFAULT_MODEL },
+    defaults: {
+      model: DEFAULT_MODEL,
+      use_persona: DEFAULT_USE_PERSONA,
+      persona_name: DEFAULT_PERSONA_NAME,
+      persona_id: DEFAULT_PERSONA_ID,
+      task: DEFAULT_TASK,
+    },
   };
 }
 
@@ -69,6 +89,12 @@ export interface AudioInfo {
   negative_tags?: string; // Negative tags of music.
   duration?: string; // Duration of the audio
   error_message?: string; // Error message if any
+}
+
+interface GenerationOptions {
+  use_persona?: boolean;
+  persona_id?: string;
+  task?: string;
 }
 
 interface PersonaResponse {
@@ -100,7 +126,7 @@ interface PersonaResponse {
 }
 
 class SunoApi {
-  private static BASE_URL: string = 'https://studio-api.prod.suno.com';
+  private static BASE_URL: string = 'https://studio-api-prod.suno.com';
   private static CLERK_BASE_URL: string = 'https://clerk.suno.com';
   private static CLERK_VERSION = '5.15.0';
 
@@ -113,6 +139,7 @@ class SunoApi {
   private solver = new Solver(process.env.TWOCAPTCHA_KEY + '');
   private ghostCursorEnabled = yn(process.env.BROWSER_GHOST_CURSOR, { default: false });
   private cursor?: Cursor;
+  private latestPersonaId?: string;
 
   constructor(cookies: string) {
     this.userAgent = new UserAgent(/Macintosh/).random().toString(); // Usually Mac systems get less amount of CAPTCHAs
@@ -123,11 +150,11 @@ class SunoApi {
       headers: {
         'Affiliate-Id': 'undefined',
         'Device-Id': `"${this.deviceId}"`,
-        'x-suno-client': 'Android prerelease-4nt180t 1.0.42',
-        'X-Requested-With': 'com.suno.android',
-        'sec-ch-ua': '"Chromium";v="130", "Android WebView";v="130", "Not?A_Brand";v="99"',
-        'sec-ch-ua-mobile': '?1',
-        'sec-ch-ua-platform': '"Android"',
+        'Origin': 'https://suno.com',
+        'Referer': 'https://suno.com/create',
+        'sec-ch-ua': '"Chromium";v="130", "Google Chrome";v="130", "Not_A Brand";v="24"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"macOS"',
         'User-Agent': this.userAgent
       }
     });
@@ -323,6 +350,8 @@ class SunoApi {
    * @returns {BrowserContext}
    */
   private async launchBrowser(): Promise<BrowserContext> {
+    const headless =
+      yn(process.env.BROWSER_HEADLESS, { default: true }) || !process.env.DISPLAY;
     const args = [
       '--disable-blink-features=AutomationControlled',
       '--disable-web-security',
@@ -345,7 +374,7 @@ class SunoApi {
         '--disable-setuid-sandbox');
     const browser = await this.getBrowserType().launch({
       args,
-      headless: yn(process.env.BROWSER_HEADLESS, { default: true })
+      headless
     });
     const context = await browser.newContext({
       userAgent: this.userAgent,
@@ -641,8 +670,59 @@ class SunoApi {
       throw new Error('Could not find the Create button on https://suno.com/create (UI may have changed).');
     };
 
+    const dismissBlockingDialogs = async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await page.getByLabel('Close').click({ timeout: 1_000 }).catch(() => {});
+      await page.locator('[role="dialog"] button').filter({ hasText: /close|skip|not now|maybe later/i }).first().click({ timeout: 1_000 }).catch(() => {});
+      await page.evaluate(() => {
+        for (const dialog of document.querySelectorAll('[role="dialog"]')) {
+          (dialog as HTMLElement).remove();
+        }
+        for (const overlay of document.querySelectorAll('[data-radix-dialog-overlay], [data-radix-portal], [data-state="open"][style*="pointer-events"]')) {
+          if (overlay instanceof HTMLElement)
+            overlay.style.display = 'none';
+        }
+        document.body.style.pointerEvents = 'auto';
+        document.body.style.overflow = 'auto';
+      }).catch(() => {});
+    };
+
+    const populatePromptInput = async (input: Locator, value: string) => {
+      await dismissBlockingDialogs();
+      await input.click();
+      try {
+        await input.fill('');
+      } catch {}
+
+      await input.evaluate((el) => {
+        const element = el as HTMLElement & { value?: string };
+        if ('value' in element)
+          (element as HTMLInputElement | HTMLTextAreaElement).value = '';
+        else
+          element.textContent = '';
+        element.dispatchEvent(new Event('input', { bubbles: true }));
+        element.dispatchEvent(new Event('change', { bubbles: true }));
+      }).catch(() => {});
+
+      await input.click();
+      await page.keyboard.type(value, { delay: 20 });
+
+      await input.evaluate((el, prompt) => {
+        const element = el as HTMLElement & { value?: string };
+        if ('value' in element)
+          (element as HTMLInputElement | HTMLTextAreaElement).value = prompt as string;
+        else
+          element.textContent = prompt as string;
+        element.dispatchEvent(new Event('input', { bubbles: true }));
+        element.dispatchEvent(new Event('change', { bubbles: true }));
+      }, value).catch(() => {});
+
+      await page.keyboard.press('Tab').catch(() => {});
+    };
+
+    await dismissBlockingDialogs();
     const textarea = await findPromptInput();
-    await textarea.fill('Lorem ipsum');
+    await populatePromptInput(textarea, 'Lorem ipsum');
 
     const button = await findCreateButton();
 
@@ -848,11 +928,34 @@ class SunoApi {
     });
 
     const challengeFrameSelector =
-      'iframe[title*="hCaptcha challenge"], iframe[src*="hcaptcha"][src*="frame=challenge"], iframe[src*="challenge-platform"]';
+      'iframe[title*="hCaptcha challenge"], iframe[title*="Main content of the hCaptcha challenge"], iframe[src*="hcaptcha"][src*="frame=challenge"], iframe[src*="challenge-platform"], iframe[src*="hcaptcha.com/captcha"]';
+    const widgetFrameSelector =
+      'iframe[title*="checkbox"], iframe[title*="hCaptcha"], iframe[src*="hcaptcha"][src*="checkbox"], iframe[src*="hcaptcha.com/captcha"]';
+
+    const clickHCaptchaWidgetIfPresent = async () => {
+      const frames = page.locator(widgetFrameSelector);
+      const count = await frames.count().catch(() => 0);
+      for (let i = 0; i < count; i++) {
+        const frame = frames.nth(i);
+        const title = (await frame.getAttribute('title').catch(() => '')) || '';
+        if (title.toLowerCase().includes('challenge'))
+          continue;
+        if (!await frame.isVisible().catch(() => false))
+          continue;
+        const box = await frame.boundingBox().catch(() => null);
+        if (!box)
+          continue;
+        await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+        logger.info({ title }, 'Clicked hCaptcha widget iframe');
+        return true;
+      }
+      return false;
+    };
 
     const waitForHCaptchaChallengeFrame = async () => {
       const initialWaitMs = Number.parseInt(process.env.CAPTCHA_INITIAL_WAIT_MS || '', 10) || 120000;
       const deadline = Date.now() + initialWaitMs;
+      let widgetClickedAt = 0;
 
       while (Date.now() < deadline) {
         if (controller.signal.aborted)
@@ -871,6 +974,12 @@ class SunoApi {
             if (ready > 0)
               return;
           }
+
+          if (Date.now() - widgetClickedAt > 2_000) {
+            const clicked = await clickHCaptchaWidgetIfPresent().catch(() => false);
+            if (clicked)
+              widgetClickedAt = Date.now();
+          }
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           const isTransient =
@@ -886,17 +995,37 @@ class SunoApi {
         await page.waitForTimeout(500);
       }
 
-      throw new Error(`No hCaptcha request occurred within ${initialWaitMs / 1000} seconds.`);
+      const iframeSummary = await page.locator('iframe').evaluateAll((els) =>
+        els.map((el) => ({
+          title: el.getAttribute('title'),
+          src: el.getAttribute('src'),
+        }))
+      ).catch(() => []);
+      const frameUrls = page.frames().map((frame) => frame.url());
+      throw new Error(
+        `No hCaptcha request occurred within ${initialWaitMs / 1000} seconds. iframes=${JSON.stringify(iframeSummary)} frames=${JSON.stringify(frameUrls)}`
+      );
     };
 
     const solveHCaptchaChallenge = async () => {
       const frame = page.frameLocator(challengeFrameSelector).first();
       const challenge = frame.locator('.challenge-container');
+      let rounds = 0;
       let wait = true;
       while (true) {
+        if (settled || controller.signal.aborted)
+          return;
+        rounds++;
+        if (rounds > CAPTCHA_MAX_CHALLENGE_ROUNDS) {
+          const promptText = await challenge.locator('.prompt-text').first().innerText().catch(() => '');
+          throw new Error(
+            `hCaptcha interactive solve exceeded ${CAPTCHA_MAX_CHALLENGE_ROUNDS} rounds (prompt=${JSON.stringify(promptText)})`
+          );
+        }
         if (wait)
           await waitForHCaptchaChallengeFrame();
-        const drag = (await challenge.locator('.prompt-text').first().innerText()).toLowerCase().includes('drag');
+        const promptText = await challenge.locator('.prompt-text').first().innerText().catch(() => '');
+        const drag = promptText.toLowerCase().includes('drag');
         let captcha: any;
         for (let j = 0; j < 3; j++) { // try several times because sometimes 2Captcha could return an error
           try {
@@ -909,6 +1038,8 @@ class SunoApi {
               // Say to the worker that he needs to click
               payload.textinstructions = 'CLICK on the shapes at their edge or center as shown above—please be precise!';
               payload.imginstructions = (await fs.readFile(path.join(process.cwd(), 'public', 'drag-instructions.jpg'))).toString('base64');
+            } else if (promptText) {
+              payload.textinstructions = promptText.replace(/\s+/g, ' ').trim().slice(0, 140);
             }
             captcha = await this.solver.coordinates(payload);
             break;
@@ -957,6 +1088,20 @@ class SunoApi {
             throw e;
           }
         }
+
+        // Give Suno time to either accept the challenge and fire /api/generate/v2
+        // or update the challenge UI before we request another worker answer.
+        await Promise.race([
+          tokenPromise.then(() => undefined).catch(() => undefined),
+          page.waitForTimeout(CAPTCHA_POST_SUBMIT_WAIT_MS),
+        ]);
+        if (settled || controller.signal.aborted)
+          return;
+
+        if (rounds % CAPTCHA_REFRESH_AFTER_ROUNDS === 0) {
+          await frame.locator('.button-reload, [aria-label*="refresh"], [title*="refresh"]').first().click({ timeout: 1000 }).catch(() => {});
+          wait = true;
+        }
       }
     };
 
@@ -983,13 +1128,17 @@ class SunoApi {
           const solvedTurnstile = await solveTurnstile();
           if (!solvedTurnstile) {
             let solvedHCaptchaToken = false;
-            try {
-              solvedHCaptchaToken = await solveHCaptchaToken();
-            } catch (e) {
-              logger.warn(
-                { error: e instanceof Error ? e.message : String(e) },
-                'hCaptcha token solve failed; falling back to interactive challenge'
-              );
+            if (!CAPTCHA_SKIP_HCAPTCHA_TOKEN_SOLVE) {
+              try {
+                solvedHCaptchaToken = await solveHCaptchaToken();
+              } catch (e) {
+                logger.warn(
+                  { error: e instanceof Error ? e.message : String(e) },
+                  'hCaptcha token solve failed; falling back to interactive challenge'
+                );
+              }
+            } else {
+              logger.info('Skipping hCaptcha token solve because SUNO_SKIP_HCAPTCHA_TOKEN_SOLVE is enabled');
             }
 
             if (!solvedHCaptchaToken) {
@@ -1036,7 +1185,8 @@ class SunoApi {
     prompt: string,
     make_instrumental: boolean = false,
     model?: string,
-    wait_audio: boolean = false
+    wait_audio: boolean = false,
+    options: GenerationOptions = {}
   ): Promise<AudioInfo[]> {
     await this.keepAlive(false);
     const startTime = Date.now();
@@ -1049,7 +1199,9 @@ class SunoApi {
         undefined,
         make_instrumental,
         model,
-        wait_audio
+        wait_audio,
+        undefined,
+        options
       )
     );
     const costTime = Date.now() - startTime;
@@ -1099,7 +1251,8 @@ class SunoApi {
     make_instrumental: boolean = false,
     model?: string,
     wait_audio: boolean = false,
-    negative_tags?: string
+    negative_tags?: string,
+    options: GenerationOptions = {}
   ): Promise<AudioInfo[]> {
     const startTime = Date.now();
     const audios = await this.withTransientCreateRetry(
@@ -1112,7 +1265,8 @@ class SunoApi {
         make_instrumental,
         model,
         wait_audio,
-        negative_tags
+        negative_tags,
+        options
       )
     );
     const costTime = Date.now() - startTime;
@@ -1146,21 +1300,45 @@ class SunoApi {
     model?: string,
     wait_audio: boolean = false,
     negative_tags?: string,
+    options: GenerationOptions = {},
     task?: string,
     continue_clip_id?: string,
     continue_at?: number
   ): Promise<AudioInfo[]> {
     await this.keepAlive();
+    const requestedModel = (model || DEFAULT_MODEL || '').trim();
+    const useLatestModel = ['v5.5', 'chirp-fenix'].includes(requestedModel.toLowerCase());
+    const effectiveModel = useLatestModel ? 'chirp-fenix' : requestedModel;
+    const explicitUsePersona = typeof options.use_persona === 'boolean' ? options.use_persona : undefined;
+    const usePersona =
+      !make_instrumental &&
+      (explicitUsePersona === true ||
+        Boolean(options.persona_id) ||
+        (explicitUsePersona !== false && DEFAULT_USE_PERSONA));
+    const effectiveTask =
+      task ??
+      options.task ??
+      (useLatestModel && usePersona && !make_instrumental ? DEFAULT_TASK : undefined);
+    const latestPersonaId =
+      useLatestModel && usePersona && !make_instrumental
+        ? options.persona_id || DEFAULT_PERSONA_ID || await this.getLatestModelPersonaId()
+        : undefined;
     const payload: any = {
       make_instrumental: make_instrumental,
-      mv: model || DEFAULT_MODEL,
+      mv: effectiveModel,
       prompt: '',
       generation_type: 'TEXT',
       continue_at: continue_at,
       continue_clip_id: continue_clip_id,
-      task: task,
+      task: effectiveTask,
       token: await this.getCaptcha()
     };
+    if (useLatestModel) {
+      payload.uses_latest_model = true;
+      payload.control_sliders = { audio_weight: 1 };
+      if (latestPersonaId)
+        payload.persona_id = latestPersonaId;
+    }
     if (isCustom) {
       payload.tags = tags;
       payload.title = title;
@@ -1178,8 +1356,17 @@ class SunoApi {
             tags: tags,
             title: title,
             make_instrumental: make_instrumental,
+            model: requestedModel,
+            effectiveModel,
+            useLatestModel,
+            usePersona,
+            effectiveTask,
+            latestPersonaId,
+            defaultUsePersona: DEFAULT_USE_PERSONA,
+            defaultPersonaName: DEFAULT_PERSONA_NAME,
             wait_audio: wait_audio,
             negative_tags: negative_tags,
+            options,
             payload: {
               ...payload,
               token: payload.token ? '<redacted>' : payload.token,
@@ -1287,11 +1474,12 @@ class SunoApi {
     negative_tags: string = '',
     title: string = '',
     model?: string,
-    wait_audio?: boolean
+    wait_audio?: boolean,
+    options: GenerationOptions = {}
   ): Promise<AudioInfo[]> {
     return this.withTransientCreateRetry(
       'extend_audio',
-      () => this.generateSongs(prompt, true, tags, title, false, model, wait_audio, negative_tags, 'extend', audioId, continueAt)
+      () => this.generateSongs(prompt, true, tags, title, false, model, wait_audio, negative_tags, options, 'extend', audioId, continueAt)
     );
   }
 
@@ -1401,6 +1589,34 @@ class SunoApi {
       duration: audio.metadata.duration,
       error_message: audio.metadata.error_message
     }));
+  }
+
+  private async getLatestModelPersonaId(): Promise<string | undefined> {
+    if (this.latestPersonaId)
+      return this.latestPersonaId;
+
+    try {
+      const response = await this.client.get(`${SunoApi.BASE_URL}/api/feed/v2`, {
+        timeout: 10000
+      });
+      const clips = response.data?.clips || [];
+      const latestFenix = clips.find((clip: any) =>
+        clip?.model_name === 'chirp-fenix' &&
+        clip?.metadata?.persona_id &&
+        clip?.metadata?.task === 'vox'
+      );
+      if (latestFenix?.metadata?.persona_id) {
+        this.latestPersonaId = latestFenix.metadata.persona_id;
+        return this.latestPersonaId;
+      }
+    } catch (error) {
+      logger.warn(
+        { error: error instanceof Error ? error.message : String(error) },
+        'Failed to resolve latest-model persona_id'
+      );
+    }
+
+    return undefined;
   }
 
   /**

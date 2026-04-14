@@ -9,13 +9,18 @@ export async function POST(req: NextRequest) {
   if (req.method === 'POST') {
     try {
       const body = await req.json();
-      const { prompt, make_instrumental, model, wait_audio } = body;
+      const { prompt, make_instrumental, model, wait_audio, use_persona, persona_id, task } = body;
 
       const audioInfo = await (await sunoApi((await cookies()).toString())).generate(
         prompt,
         Boolean(make_instrumental),
         model || DEFAULT_MODEL,
-        Boolean(wait_audio)
+        Boolean(wait_audio),
+        {
+          use_persona: use_persona === undefined ? undefined : Boolean(use_persona),
+          persona_id,
+          task
+        }
       );
 
       return new NextResponse(JSON.stringify(audioInfo), {

@@ -9,7 +9,19 @@ export async function POST(req: NextRequest) {
   if (req.method === 'POST') {
     try {
       const body = await req.json();
-      const { audio_id, prompt, continue_at, tags, negative_tags, title, model, wait_audio } = body;
+      const {
+        audio_id,
+        prompt,
+        continue_at,
+        tags,
+        negative_tags,
+        title,
+        model,
+        wait_audio,
+        use_persona,
+        persona_id,
+        task
+      } = body;
 
       if (!audio_id) {
         return new NextResponse(JSON.stringify({ error: 'Audio ID is required' }), {
@@ -22,7 +34,21 @@ export async function POST(req: NextRequest) {
       }
 
       const audioInfo = await (await sunoApi((await cookies()).toString()))
-        .extendAudio(audio_id, prompt, continue_at, tags || '', negative_tags || '', title, model || DEFAULT_MODEL, wait_audio || false);
+        .extendAudio(
+          audio_id,
+          prompt,
+          continue_at,
+          tags || '',
+          negative_tags || '',
+          title,
+          model || DEFAULT_MODEL,
+          wait_audio || false,
+          {
+            use_persona: use_persona === undefined ? undefined : Boolean(use_persona),
+            persona_id,
+            task
+          }
+        );
 
       return new NextResponse(JSON.stringify(audioInfo), {
         status: 200,
